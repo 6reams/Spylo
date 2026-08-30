@@ -1,6 +1,16 @@
-# SPYLO - Advanced OSINT Framework
+<p align="center">
+  <img src="logo.png" alt="SPYLO Logo" width="300">
+</p>
 
-A powerful Open Source Intelligence (OSINT) framework for domain and username reconnaissance with an interactive CLI interface.
+<h1 align="center">SPYLO</h1>
+
+<p align="center">
+  <strong>Advanced OSINT Framework</strong>
+</p>
+
+<p align="center">
+  A powerful Open Source Intelligence (OSINT) framework for domain and username reconnaissance with an interactive CLI interface.
+</p>
 
 ```
     ███████╗██████╗ ██╗   ██╗██╗      ██████╗ 
