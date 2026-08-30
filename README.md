@@ -206,7 +206,7 @@ MIT License - see LICENSE file
 
 - Issues: https://github.com/S4ddler/Spylo/issues
 - Discussions: https://github.com/S4ddler/Spylo/discussions
-- Twitter: @S4ddler
+- Twitter: @kerbrute
 
 ## Version
 
