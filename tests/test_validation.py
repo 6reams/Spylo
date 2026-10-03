@@ -101,8 +101,9 @@ def test_validate_alias_rejects(value):
 def test_validate_target_dispatches():
     assert validate_target("domain", "Example.com") == "example.com"
     assert validate_target("username", " bob ") == "bob"
+    assert validate_target("email", "Bob@Example.COM") == "bob@example.com"
     with pytest.raises(ValidationError):
-        validate_target("email", "bob@example.com")
+        validate_target("unknown_type", "anything")
 
 
 @pytest.mark.parametrize("value,expected", [

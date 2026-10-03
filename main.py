@@ -19,6 +19,7 @@ WHITE = "#ffffff"
 
 from modules.username_osint import UsernameScanner
 from modules.domain_osint import DomainScanner, DEFAULT_TOP_PORTS
+from modules.email_osint import EmailScanner
 from core.reporting import save_reports, print_table_summary, SUPPORTED_FORMATS
 from core.utils import ensure_dir
 from core.validation import (
@@ -33,17 +34,18 @@ console = Console()
 
 VERSION = "0.1.0"
 DOMAIN_SCAN_TYPES = ("all", "dns", "ports", "whois")
-TARGET_TYPES = ("domain", "username")
+EMAIL_SCAN_TYPES = ("all", "dns", "gravatar", "platforms", "breaches")
+TARGET_TYPES = ("domain", "username", "email")
 
 SESSION_FILE = Path.home() / ".spylo" / "session.json"
 
 BANNER = """
-    ███████╗██████╗ ██╗   ██╗██╗      ██████╗
+    ██████╗██████╗ ██╗   ██╗██╗      ██████╗
     ██╔════╝██╔══██╗╚██╗ ██╔╝██║     ██╔═══██╗
-    ███████╗██████╔╝ ╚████╔╝ ██║     ██║   ██║
-    ╚════██║██╔═══╝   ╚██╔╝  ██║     ██║   ██║
-    ███████║██║        ██║   ███████╗╚██████╔╝
-    ╚══════╝╚═╝        ╚═╝   ╚══════╝ ╚═════╝
+    ██████╗ ██████╔╝ ╚████╔╝ ██║     ██║   ██║
+    ╚════██╗██╔═══╝   ╚██╔╝  ██║     ██║   ██║
+    ███████║██║        ██║   ██████╗╚██████╔╝
+    ╚══════╝╚═╝        ╚═╝   ╚═════╝ ╚═════╝
 
 """
 
@@ -125,8 +127,11 @@ SETTING_SPECS = {
     "verify_tls": (_parse_bool, True, "Verify TLS certificates (disable at your own risk)"),
     "no_axfr": (_parse_bool, True, "Skip AXFR zone-transfer attempts"),
     "no_scan_ports": (_parse_bool, True, "Skip port scanning during full scans"),
+    "no_platform_probe": (_parse_bool, True, "Skip third-party platform probing in email scans"),
     # Proxy URLs can embed credentials, so this one is never written to disk.
     "proxy": (_parse_optional_str, False, "Proxy URL (not saved to disk)"),
+    # HIBP key is sensitive; user must supply it per-session.
+    "hibp_api_key": (_parse_optional_str, False, "HaveIBeenPwned API key (not saved to disk)"),
 }
 
 DEFAULT_SETTINGS = {
@@ -141,7 +146,9 @@ DEFAULT_SETTINGS = {
     "verify_tls": True,
     "no_axfr": False,
     "no_scan_ports": False,
+    "no_platform_probe": False,
     "proxy": None,
+    "hibp_api_key": None,
 }
 
 
@@ -398,7 +405,7 @@ class SPYLOShell(cmd.Cmd):
 
         alias, target_type, target = parts
         if target_type not in TARGET_TYPES:
-            self.console.print("[red]Error: Type must be 'domain' or 'username'[/red]")
+            self.console.print("[red]Error: Type must be 'domain', 'username', or 'email'[/red]")
             return
 
         try:
@@ -576,6 +583,12 @@ class SPYLOShell(cmd.Cmd):
                 self.console.print(f"Available types: {', '.join(DOMAIN_SCAN_TYPES)}")
                 return
             result = self._scan_domain(alias, target, scan_type)
+        elif module == "email":
+            if scan_type not in EMAIL_SCAN_TYPES:
+                self.console.print("[red]Error: Invalid scan type for email[/red]")
+                self.console.print(f"Available types: {', '.join(EMAIL_SCAN_TYPES)}")
+                return
+            result = self._scan_email(target, scan_type)
         else:
             scan_type = "username"
             result = self._scan_username(target)
@@ -626,6 +639,41 @@ class SPYLOShell(cmd.Cmd):
         )
         try:
             return scanner.scan(target)
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]Scan interrupted[/yellow]")
+            return None
+
+    def _scan_email(self, target, scan_type):
+        no_platform = self.session.settings.get("no_platform_probe", False)
+        hibp_key = self.session.settings.get("hibp_api_key")
+        scanner = EmailScanner(
+            timeout=self.session.timeout,
+            proxy=self.session.proxy,
+            verify_tls=self.session.verify_tls,
+            hibp_api_key=hibp_key,
+            no_platform_probe=no_platform or (scan_type not in ("all", "platforms")),
+            no_breach_check=(scan_type not in ("all", "breaches")),
+        )
+        label = {
+            "all": "Running full email reconnaissance",
+            "dns": "Checking email DNS records",
+            "gravatar": "Looking up Gravatar profile",
+            "platforms": "Probing platform registrations",
+            "breaches": "Checking breach databases",
+        }[scan_type]
+        try:
+            with self.console.status(
+                f"[bold blue]Scanning {target}...\n[dim]{label}...[/dim]"
+            ):
+                if scan_type == "dns":
+                    return {"email": target, "dns": scanner.scan_dns(target)}
+                if scan_type == "gravatar":
+                    return {"email": target, "gravatar": scanner.scan_gravatar(target)}
+                if scan_type == "platforms":
+                    return {"email": target, "platforms": scanner.scan_platforms(target)}
+                if scan_type == "breaches":
+                    return {"email": target, "breaches": scanner.scan_breaches(target)}
+                return scanner.scan(target)
         except KeyboardInterrupt:
             self.console.print("\n[yellow]Scan interrupted[/yellow]")
             return None
@@ -697,6 +745,8 @@ class SPYLOShell(cmd.Cmd):
             info = self.session.targets.get(alias)
             if info and info["type"] == "domain":
                 return [t for t in DOMAIN_SCAN_TYPES if t.startswith(text)]
+            if info and info["type"] == "email":
+                return [t for t in EMAIL_SCAN_TYPES if t.startswith(text)]
         return []
 
     complete_scan = _complete_scan

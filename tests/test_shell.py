@@ -36,7 +36,6 @@ def test_add_persists_immediately(shell):
     "site1",
     "site1 domain",
     "site1 domain example.com extra",
-    "site1 email a@b.com",
     "site1 domain ../../etc/passwd",
     "site1 domain http://example.com",
     "site1 username a/b",
@@ -337,8 +336,9 @@ def test_complete_del_suggests_aliases(shell):
 
 
 def test_complete_add_suggests_types(shell):
-    assert shell.complete_add("", "add site1 ", 10, 10) == ["domain", "username"]
+    assert shell.complete_add("", "add site1 ", 10, 10) == ["domain", "username", "email"]
     assert shell.complete_add("u", "add site1 u", 10, 11) == ["username"]
+    assert shell.complete_add("e", "add site1 e", 10, 11) == ["email"]
     assert shell.complete_add("", "add ", 4, 4) == []
 
 
