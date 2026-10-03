@@ -169,7 +169,7 @@ def test_load_skips_invalid_targets(tmp_path, monkeypatch):
         "targets": {
             "good": {"type": "domain", "value": "example.com"},
             "bad-domain": {"type": "domain", "value": "../../etc/passwd"},
-            "bad-type": {"type": "email", "value": "a@b.com"},
+            "bad-type": {"type": "phone", "value": "555-1234"},
             "bad alias": {"type": "domain", "value": "example.com"},
             "not-a-dict": "nope",
         },

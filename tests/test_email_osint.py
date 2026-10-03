@@ -3,7 +3,13 @@ import pytest
 
 from core.validation import ValidationError, validate_email
 from modules import email_osint
-from modules.email_osint import EmailScanner, _gravatar_hash, _parse_dmarc_policy
+from modules.email_osint import (
+    EmailScanner,
+    _classify_provider,
+    _gravatar_hash,
+    _parse_dmarc_policy,
+    _spoofability_verdict,
+)
 
 
 # ------------------------------------------------------------------
@@ -387,3 +393,160 @@ def test_full_scan_summary_counts(monkeypatch):
     assert result["summary"]["mx_records"] == 1
     assert result["summary"]["gravatar_found"] is False
     assert result["summary"]["platforms_found"] == []
+
+
+# ------------------------------------------------------------------
+# _classify_provider
+# ------------------------------------------------------------------
+
+@pytest.mark.parametrize("email,expected_cat,expected_provider", [
+    ("user@gmail.com", "free", "Gmail"),
+    ("user@yahoo.com", "free", "Yahoo"),
+    ("user@outlook.com", "free", "Outlook"),
+    ("user@protonmail.com", "free", "ProtonMail"),
+    ("user@proton.me", "free", "ProtonMail"),
+    ("user@icloud.com", "free", "iCloud"),
+    ("user@yandex.com", "free", "Yandex"),
+    ("user@mail.ru", "free", "Mail.ru"),
+    ("user@companyxyz.com", "corporate", None),
+])
+def test_classify_provider_free_and_corporate(email, expected_cat, expected_provider):
+    result = _classify_provider(email)
+    assert result["category"] == expected_cat
+    assert result["provider"] == expected_provider
+
+
+@pytest.mark.parametrize("email", [
+    "user@mailinator.com",
+    "user@guerrillamail.com",
+    "user@10minutemail.com",
+    "user@yopmail.com",
+    "user@trashmail.com",
+    "user@maildrop.cc",
+])
+def test_classify_provider_disposable(email):
+    result = _classify_provider(email)
+    assert result["category"] == "disposable"
+    assert result["provider"] is None
+
+
+def test_classify_provider_case_insensitive():
+    result = _classify_provider("USER@GMAIL.COM")
+    assert result["category"] == "free"
+    assert result["provider"] == "Gmail"
+
+
+# ------------------------------------------------------------------
+# _spoofability_verdict
+# ------------------------------------------------------------------
+
+@pytest.mark.parametrize("dns_data,expected_risk,expected_spoofable", [
+    ({"spf_present": False, "dmarc_present": False}, "high", True),
+    ({"spf_present": True, "dmarc_present": False}, "medium", True),
+    ({"spf_present": True, "dmarc_present": True, "dmarc_policy": "none"}, "medium", True),
+    ({"spf_present": True, "dmarc_present": True, "dmarc_policy": "quarantine"}, "low", False),
+    ({"spf_present": True, "dmarc_present": True, "dmarc_policy": "reject"}, "none", False),
+])
+def test_spoofability_verdict(dns_data, expected_risk, expected_spoofable):
+    verdict = _spoofability_verdict(dns_data)
+    assert verdict["risk"] == expected_risk
+    assert verdict["spoofable"] is expected_spoofable
+    assert "reason" in verdict
+
+
+def test_spoofability_verdict_unknown_policy():
+    verdict = _spoofability_verdict({"spf_present": True, "dmarc_present": True, "dmarc_policy": "bogus"})
+    assert verdict["risk"] == "medium"
+    assert verdict["spoofable"] is True
+
+
+def test_scan_dns_includes_spoofability(dns_scanner):
+    result = dns_scanner.scan_dns("user@example.com")
+    assert "spoofability" in result
+    assert result["spoofability"]["risk"] == "none"
+    assert result["spoofability"]["spoofable"] is False
+
+
+# ------------------------------------------------------------------
+# Full scan classification
+# ------------------------------------------------------------------
+
+def test_full_scan_includes_classification(monkeypatch):
+    scanner = EmailScanner(no_platform_probe=True, no_breach_check=True)
+    monkeypatch.setattr(email_osint, "_resolve_txt", lambda *a, **kw: [])
+    monkeypatch.setattr(email_osint, "_resolve_mx", lambda *a, **kw: [])
+    monkeypatch.setattr(email_osint, "rate_limited_get", lambda *a, **kw: None)
+
+    result = scanner.scan("user@gmail.com")
+    assert result["classification"]["category"] == "free"
+    assert result["classification"]["provider"] == "Gmail"
+    assert result["summary"]["provider_category"] == "free"
+    assert result["summary"]["provider"] == "Gmail"
+
+
+def test_full_scan_includes_spoofability_summary(monkeypatch):
+    scanner = EmailScanner(no_platform_probe=True, no_breach_check=True)
+    monkeypatch.setattr(email_osint, "_resolve_txt", lambda *a, **kw: [])
+    monkeypatch.setattr(email_osint, "_resolve_mx", lambda *a, **kw: [])
+    monkeypatch.setattr(email_osint, "rate_limited_get", lambda *a, **kw: None)
+
+    result = scanner.scan("user@example.com")
+    assert "spoofable" in result["summary"]
+    assert "spoofability_risk" in result["summary"]
+
+
+# ------------------------------------------------------------------
+# scan_pivot
+# ------------------------------------------------------------------
+
+def test_scan_pivot_calls_username_and_domain_scanners(monkeypatch):
+    scanner = EmailScanner(no_platform_probe=True, no_breach_check=True)
+
+    username_called = []
+    domain_called = []
+
+    class FakeUsernameScanner:
+        def __init__(self, **kwargs):
+            pass
+
+        def scan(self, target):
+            username_called.append(target)
+            return {"accounts": [{"status": "found", "site": "GitHub"}]}
+
+    class FakeDomainScanner:
+        def __init__(self, **kwargs):
+            pass
+
+        def scan_dns(self, target):
+            domain_called.append(target)
+            return {"domain": target, "mx": []}
+
+    monkeypatch.setattr(email_osint, "_make_username_scanner", lambda **kw: FakeUsernameScanner(**kw))
+    monkeypatch.setattr(email_osint, "_make_domain_scanner", lambda **kw: FakeDomainScanner(**kw))
+
+    result = scanner.scan_pivot("john@example.com")
+
+    assert username_called == ["john"]
+    assert domain_called == ["example.com"]
+    assert result["local_part"] == "john"
+    assert result["domain"] == "example.com"
+    assert result["summary"]["username_accounts_found"] == 1
+
+
+def test_scan_pivot_normalises_email(monkeypatch):
+    scanner = EmailScanner(no_platform_probe=True, no_breach_check=True)
+
+    class FakeUS:
+        def __init__(self, **kw): pass
+        def scan(self, t): return {"accounts": []}
+
+    class FakeDS:
+        def __init__(self, **kw): pass
+        def scan_dns(self, t): return {"domain": t, "mx": []}
+
+    monkeypatch.setattr(email_osint, "_make_username_scanner", lambda **kw: FakeUS(**kw))
+    monkeypatch.setattr(email_osint, "_make_domain_scanner", lambda **kw: FakeDS(**kw))
+
+    result = scanner.scan_pivot("  JOHN@EXAMPLE.COM  ")
+    assert result["email"] == "john@example.com"
+    assert result["domain"] == "example.com"
