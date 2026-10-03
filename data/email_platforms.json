@@ -1,0 +1,165 @@
+{
+  "Adobe": {
+    "url": "https://auth.services.adobe.com/en_US/index.html#check_email",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"email": "{email}"},
+    "hit": "account already exists",
+    "miss": "no account",
+    "response_type": "html",
+    "notes": "Checks via sign-in flow"
+  },
+  "Archive.org": {
+    "url": "https://archive.org/account/login.php",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"username": "{email}", "password": "invalid_spylo_check_1234"},
+    "hit": "wrong password",
+    "miss": "no account",
+    "response_type": "html"
+  },
+  "Duolingo": {
+    "url": "https://www.duolingo.com/2017-06-30/users",
+    "method": "GET",
+    "params": {"email": "{email}"},
+    "hit_json": {"path": "users", "check": "non_empty"},
+    "miss_json": {"path": "users", "check": "empty"},
+    "response_type": "json"
+  },
+  "Figma": {
+    "url": "https://www.figma.com/api/user/check_email",
+    "method": "POST",
+    "content_type": "application/json",
+    "data": {"email": "{email}"},
+    "hit": "email is already in use",
+    "miss": "available",
+    "response_type": "json"
+  },
+  "GitHub": {
+    "url": "https://github.com/signup_check/email",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"value": "{email}"},
+    "hit": "Email is already taken",
+    "miss": null,
+    "response_type": "html"
+  },
+  "GitLab": {
+    "url": "https://gitlab.com/users/sign_in",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"user[login]": "{email}", "user[password]": "invalid_spylo_1234"},
+    "miss": "Invalid login or password",
+    "hit": null,
+    "response_type": "html",
+    "notes": "Absence of 'account not found' vs 'wrong password'"
+  },
+  "Imgur": {
+    "url": "https://imgur.com/signin",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"email": "{email}", "password": "invalid_spylo_1234"},
+    "hit": "Incorrect password",
+    "miss": "no account",
+    "response_type": "html"
+  },
+  "Instagram": {
+    "url": "https://www.instagram.com/accounts/login/ajax/",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"username": "{email}", "enc_password": "#PWD_INSTAGRAM_BROWSER:0:1:invalid"},
+    "hit": "The password you entered is incorrect",
+    "miss": "We couldn't find an account",
+    "response_type": "json"
+  },
+  "Kickstarter": {
+    "url": "https://www.kickstarter.com/errors/email",
+    "method": "GET",
+    "params": {"email": "{email}"},
+    "hit": "email is already registered",
+    "miss": null,
+    "response_type": "json"
+  },
+  "LastPass": {
+    "url": "https://lastpass.com/create_account.php",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"checkEmail": "1", "email": "{email}"},
+    "hit": "exists",
+    "miss": "available",
+    "response_type": "text"
+  },
+  "LinkedIn": {
+    "url": "https://www.linkedin.com/uas/login-submit",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"session_key": "{email}", "session_password": "invalid_spylo_1234"},
+    "hit": "password is incorrect",
+    "miss": "email address wasn't recognized",
+    "response_type": "html"
+  },
+  "Notion": {
+    "url": "https://www.notion.so/api/v3/loginWithEmail",
+    "method": "POST",
+    "content_type": "application/json",
+    "data": {"email": "{email}", "password": "invalid_spylo_1234"},
+    "hit": "user does not have a password",
+    "miss": "user not found",
+    "response_type": "json"
+  },
+  "Pinterest": {
+    "url": "https://www.pinterest.com/resource/UserSessionResource/create/",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"data": "{\"options\":{\"username_or_email\":\"{email}\",\"password\":\"invalid_spylo_1234\"}}"},
+    "hit": "Your password is incorrect",
+    "miss": "Hmm, we can't find that email",
+    "response_type": "json"
+  },
+  "Snapchat": {
+    "url": "https://accounts.snapchat.com/accounts/get_teaser_data",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"email": "{email}"},
+    "hit": "phone",
+    "miss": "not_found",
+    "response_type": "json"
+  },
+  "Spotify": {
+    "url": "https://spclient.wg.spotify.com/signup/public/v1/account",
+    "method": "GET",
+    "params": {
+      "validate": "1",
+      "email": "{email}",
+      "displayname": "",
+      "platform": "www",
+      "referrer": "",
+      "product": "0"
+    },
+    "hit": "This email address is already registered",
+    "miss": null,
+    "response_type": "json"
+  },
+  "Tumblr": {
+    "url": "https://www.tumblr.com/svc/auth/login_check",
+    "method": "POST",
+    "content_type": "application/x-www-form-urlencoded",
+    "data": {"email": "{email}"},
+    "hit_json": {"path": "has_account", "check": "true"},
+    "response_type": "json"
+  },
+  "Twitter": {
+    "url": "https://api.twitter.com/i/users/email_available.json",
+    "method": "GET",
+    "params": {"email": "{email}"},
+    "hit_json": {"path": "taken", "check": "true"},
+    "response_type": "json"
+  },
+  "Wordpress": {
+    "url": "https://public-api.wordpress.com/rest/v1.1/users/{email}/auth-options",
+    "method": "GET",
+    "hit": "email_login",
+    "miss": "unknown_user",
+    "response_type": "json"
+  }
+}

@@ -11,12 +11,14 @@ from typing import Optional
 MAX_DOMAIN_LEN = 253
 MAX_LABEL_LEN = 63
 MAX_USERNAME_LEN = 64
+MAX_EMAIL_LEN = 254
 
 _LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 _TLD_RE = re.compile(r"^[a-z]{2,63}$")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}[A-Za-z0-9]$|^[A-Za-z0-9]$")
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
 
 class ValidationError(ValueError):
@@ -39,7 +41,7 @@ def validate_domain(value: str) -> str:
         raise ValidationError(f"Domain exceeds {MAX_DOMAIN_LEN} characters")
     if "://" in domain:
         raise ValidationError("Pass a bare domain, not a URL (e.g. example.com)")
-    if any(ch in domain for ch in "/\\?#@:[] \t\n\r'\"|&;$`<>()*,!{}^~%+="):
+    if any(ch in domain for ch in "/\\?#@:[] \t\n\r'\"| &;$`<>()*,!{}^~%+="):
         raise ValidationError("Domain contains invalid characters")
     if ".." in domain:
         raise ValidationError("Domain contains an empty label")
@@ -113,12 +115,31 @@ def validate_alias(value: str) -> str:
     return alias
 
 
+def validate_email(value: str) -> str:
+    """Return the normalized email address, or raise ValidationError."""
+    if not isinstance(value, str):
+        raise ValidationError("Email must be a string")
+    email = value.strip().lower()
+    if not email:
+        raise ValidationError("Email must not be empty")
+    if len(email) > MAX_EMAIL_LEN:
+        raise ValidationError(f"Email exceeds {MAX_EMAIL_LEN} characters")
+    if not _EMAIL_RE.match(email):
+        raise ValidationError(f"Invalid email address '{email}'")
+    local, domain = email.rsplit("@", 1)
+    if len(local) > 64:
+        raise ValidationError("Email local-part exceeds 64 characters")
+    return email
+
+
 def validate_target(target_type: str, value: str) -> str:
     """Dispatch to the validator for `target_type`."""
     if target_type == "domain":
         return validate_domain(value)
     if target_type == "username":
         return validate_username(value)
+    if target_type == "email":
+        return validate_email(value)
     raise ValidationError(f"Unknown target type '{target_type}'")
 
 
