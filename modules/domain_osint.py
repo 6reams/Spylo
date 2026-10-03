@@ -1,32 +1,61 @@
 import concurrent.futures
-import ipaddress
-import json
 import socket
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
+from urllib.parse import quote
 
 import dns.resolver
 import requests
 import whois
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, BarColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.panel import Panel
-from rich.box import ROUNDED, SQUARE
+from rich.box import SQUARE
 
 # Modern minimal color scheme
 PRIMARY_BLUE = "#0066cc"  # Deeper blue for main elements
 SECONDARY_BLUE = "#4d94ff"  # Lighter blue for secondary elements
 WHITE = "#ffffff"  # Pure white
 
+from core.ratelimit import crtsh_limiter, geoip_limiter, rate_limited_get
 from core.utils import which, run_cmd, grab_banner, fetch_tls_cert, extract_cert_summary
+from core.validation import parse_ports, validate_dns_server
 
 console = Console()
+
+
+def _first_line(text: Optional[str], limit: int = 80) -> str:
+    """Condense a banner to one printable line.
+
+    Banners are whole HTTP responses, which are unusable both as a table
+    cell and as a `service` value in the saved report.
+    """
+    if not text:
+        return ""
+    line = text.splitlines()[0].strip() if text.strip() else ""
+    return line[:limit]
+
+
+def _describe_cert(cert_info: Optional[dict]) -> str:
+    """Render a certificate summary as a short string."""
+    if not cert_info:
+        return ""
+    expires = cert_info.get("notAfter")
+    return f"cert expires {expires}" if expires else "cert present"
+
 
 SUPPORTED_RRTYPES = [
     "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "CAA", "DS", "DNSKEY",
 ]
+
+DEFAULT_TOP_PORTS = (
+    "21,22,23,25,53,80,81,110,111,135,139,143,443,445,465,587,993,995,1025,1433,1521,"
+    "1723,2082,2083,2086,2087,2095,2096,2222,2375,2376,3000,3128,3306,3389,4444,5000,"
+    "5432,5555,5672,5900,5984,6379,7000,8000,8008,8080,8081,8082,8083,8086,8088,8443,"
+    "8880,8888,9000,9042,9090,9200,9300,10000,11211,27017,27018,28017,50000,50070"
+)
+
 
 @dataclass
 class DomainScanner:
@@ -34,9 +63,15 @@ class DomainScanner:
     proxy: Optional[str] = None
     no_axfr: bool = False
     no_scan_ports: bool = False
-    top_ports: str = "21,22,23,25,26,53,80,81,110,111,135,139,143,443,445,465,587,995,1723,3306,3389,5900,8080,8443,995,993,5432,3306,2222,2087,2086,2083,2082,2095,2096,8443,8880,8081,8888,9090,1025,1433,1434,1521,3128,3306,4242,4243,4567,5222,5223,5432,6379,7000,7001,8000,8008,8080,8443,8888,9092,9200,9300,10000,11211,27017,28017,49152,49153,49154,49155,49156,49157,50000,6379,2375,2376,6000,13306,3000,4444,5000,5555,5672,5984,6082,8009,8010,8082,8083,8084,8085,8086,8087,8088,8089,8090,8091,8443,9000,9001,9042,9160,9042,9200,9300,11211,11214,11215,27017,27018,27019,28017,50000,50030,50070"
+    top_ports: str = DEFAULT_TOP_PORTS
     wordlist: Optional[str] = None
     dns_server: Optional[str] = None
+
+    def __post_init__(self):
+        # dns_server is interpolated into `dig @<server>` argv, so it is
+        # pinned to a literal IP here rather than trusted downstream.
+        self.dns_server = validate_dns_server(self.dns_server)
+        self.ports = parse_ports(self.top_ports)
 
     def scan_whois(self, domain: str) -> dict:
         """Perform WHOIS lookup for a domain"""
@@ -225,7 +260,7 @@ class DomainScanner:
                     return result
                 
                 # Start port scanning
-                total_ports = len(ips) * len(self.top_ports.split(","))
+                total_ports = len(ips) * len(self.ports)
                 scan_task = progress.add_task(
                     f"[{PRIMARY_BLUE}]Scanning ports[/{PRIMARY_BLUE}]",
                     total=total_ports
@@ -240,7 +275,7 @@ class DomainScanner:
                 found_open_ports = False
                 for ip in ips:
                     result["ports"][ip] = {}
-                    for port in map(int, self.top_ports.split(",")):
+                    for port in self.ports:
                         progress.update(
                             scan_task,
                             advance=1,
@@ -248,35 +283,37 @@ class DomainScanner:
                         )
                         
                         try:
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            sock.settimeout(self.timeout)
-                            if sock.connect_ex((ip, port)) == 0:
-                                found_open_ports = True
-                                banner = grab_banner(ip, port, self.timeout)
-                                cert = fetch_tls_cert(ip, port) if port in [443, 8443] else None
-                                cert_info = extract_cert_summary(cert) if cert else None
-                                service_name = banner if banner else "unknown"
-                                
-                                result["ports"][ip][port] = {
-                                    "state": "open",
-                                    "service": service_name
-                                }
-                            
-                                details = []
-                                if banner:
-                                    details.append(banner)
-                                if cert_info:
-                                    details.append(cert_info)
-                                
-                                scan_table.add_row(
-                                    f"[{SECONDARY_BLUE}]{ip}[/{SECONDARY_BLUE}]",
-                                    f"[{WHITE}]{port}[/{WHITE}]",
-                                    f"[{SECONDARY_BLUE}]{service_name}[/{SECONDARY_BLUE}]",
-                                    f"[{WHITE}]{' '.join(details)}[/{WHITE}]"
-                                )
-                            sock.close()
-                        except Exception:
+                            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                                sock.settimeout(self.timeout)
+                                if sock.connect_ex((ip, port)) != 0:
+                                    continue
+                        except OSError:
                             continue
+
+                        found_open_ports = True
+                        banner = grab_banner(ip, port, self.timeout)
+                        service_name = _first_line(banner) or "unknown"
+
+                        # A cert that cannot be fetched or verified must not
+                        # discard the open port we already confirmed.
+                        cert_info = None
+                        if port in (443, 8443):
+                            try:
+                                cert_info = extract_cert_summary(fetch_tls_cert(ip, port))
+                            except Exception:
+                                cert_info = None
+
+                        entry = {"state": "open", "service": service_name}
+                        if cert_info:
+                            entry["tls"] = cert_info
+                        result["ports"][ip][port] = entry
+
+                        scan_table.add_row(
+                            f"[{SECONDARY_BLUE}]{ip}[/{SECONDARY_BLUE}]",
+                            f"[{WHITE}]{port}[/{WHITE}]",
+                            f"[{SECONDARY_BLUE}]{service_name}[/{SECONDARY_BLUE}]",
+                            f"[{WHITE}]{_describe_cert(cert_info)}[/{WHITE}]"
+                        )
                 
                 console.print()
                 if found_open_ports:
@@ -315,17 +352,139 @@ class DomainScanner:
             ports_result = self.scan_ports(domain)
             result.update(ports_result)
         
-        # Gather additional information and update result
-        # Add summary information
+        # Gather IPs from A and AAAA records before the passive recon phase
+        result.setdefault("dns", {"records": {}})
+        ips = set()
+        for rec in ["A", "AAAA"]:
+            ips.update(result["dns"].get("records", {}).get(rec, []))
+
+        # Start with reverse DNS lookups
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"[{PRIMARY_BLUE}]Performing reverse DNS lookups[/{PRIMARY_BLUE}]")
+            rev = {}
+            for ip in ips:
+                try:
+                    rev[ip] = socket.gethostbyaddr(ip)[0]
+                except Exception:
+                    rev[ip] = None
+            result["dns"]["reverse"] = rev
+            progress.update(task, completed=100)
+
+        # Check DNSSEC
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"[{PRIMARY_BLUE}]Checking DNSSEC[/{PRIMARY_BLUE}]")
+            dnssec_present = bool(result["dns"].get("records", {}).get("DS") or
+                                  result["dns"].get("records", {}).get("DNSKEY"))
+            result["dns"]["dnssec_present"] = dnssec_present
+            progress.update(task, completed=100)
+
+        # Zone transfers if enabled
+        if not self.no_axfr:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True
+            ) as progress:
+                task = progress.add_task(f"[{PRIMARY_BLUE}]Checking zone transfers[/{PRIMARY_BLUE}]")
+                axfr_findings = []
+                nameservers = result["dns"].get("records", {}).get("NS", []) or []
+
+                for i, ns in enumerate(nameservers):
+                    progress.update(task, completed=(i / len(nameservers)) * 100)
+                    host = ns.split()[0].strip(".") if " " in ns else ns.strip(".")
+                    ok, out = self._try_axfr(host, domain)
+                    if ok:
+                        axfr_findings.append({"ns": host, "lines": out.splitlines()[:200]})
+
+                result["dns"]["axfr"] = axfr_findings
+                progress.update(task, completed=100)
+
+        # Enumerate subdomains
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"[{PRIMARY_BLUE}]Enumerating subdomains[/{PRIMARY_BLUE}]")
+            subdomains = self._enum_crtsh(domain)
+
+            if self.wordlist:
+                progress.update(task, description=f"[{PRIMARY_BLUE}]Bruteforcing subdomains[/{PRIMARY_BLUE}]")
+                resolver = dns.resolver.Resolver()
+                if self.dns_server:
+                    resolver.nameservers = [self.dns_server]
+                subs = self._brute_subdomains(domain, self.wordlist, resolver)
+                subdomains.extend(subs)
+
+            result["subdomains"] = sorted(set(subdomains))
+            progress.update(task, completed=100)
+
+        # GeoIP lookup
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"[{PRIMARY_BLUE}]Looking up GeoIP information[/{PRIMARY_BLUE}]")
+
+            geo = {}
+            for i, ip in enumerate(ips):
+                progress.update(task, completed=(i / len(ips)) * 100)
+                g = self._geoip(ip)
+                if g:
+                    geo[ip] = g
+
+            result["geoip"] = geo
+            progress.update(task, completed=100)
+
+        # HTTP and TLS checks
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"[{PRIMARY_BLUE}]Checking HTTP and TLS[/{PRIMARY_BLUE}]")
+
+            try:
+                cert = fetch_tls_cert(domain, 443, timeout=8)
+                result["tls"] = extract_cert_summary(cert)
+            except Exception:
+                result["tls"] = {}
+
+            progress.update(task, description=f"[{PRIMARY_BLUE}]Fingerprinting HTTP servers[/{PRIMARY_BLUE}]")
+            result["http"] = self._http_fingerprint(domain)
+
+            progress.update(task, completed=100)
+
+        # Summarize only once every section above has populated the result
         result["summary"] = {
-            "a_records": len(result.get("dns", {}).get("records", {}).get("A", []) or []),
+            "a_records": len(result["dns"].get("records", {}).get("A", []) or []),
             "subdomains": len(result.get("subdomains", [])),
-            "dnssec": result.get("dns", {}).get("dnssec_present", False),
+            "dnssec": result["dns"].get("dnssec_present", False),
             "open_services": sum(len(p) for p in result.get("ports", {}).values()),
             "whois_registrar": (result.get("whois", {}) or {}).get("registrar"),
         }
-        
-        # Display final summary
+
         console.print()
         console.print(Panel(
             "\n".join([
@@ -338,127 +497,6 @@ class DomainScanner:
             title=f"[{WHITE}]Domain Scan Summary[/{WHITE}]",
             box=SQUARE
         ))
-        # First gather IPs from A and AAAA records
-        ips = set()
-        for rec in ["A", "AAAA"]:
-            ips.update(result.get("dns", {}).get("records", {}).get(rec, []))
-
-            # Start with reverse DNS lookups
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True
-            ) as progress:
-                task = progress.add_task(f"[{PRIMARY_BLUE}]Performing reverse DNS lookups[/{PRIMARY_BLUE}]")
-                rev = {}
-                for ip in ips:
-                    try:
-                        rev[ip] = socket.gethostbyaddr(ip)[0]
-                    except Exception:
-                        rev[ip] = None
-                result["dns"] = result.get("dns", {})
-                result["dns"]["reverse"] = rev
-                progress.update(task, completed=100)
-
-            # Check DNSSEC
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True
-            ) as progress:
-                task = progress.add_task(f"[{PRIMARY_BLUE}]Checking DNSSEC[/{PRIMARY_BLUE}]")
-                dnssec_present = bool(result.get("dns", {}).get("records", {}).get("DS") or 
-                                    result.get("dns", {}).get("records", {}).get("DNSKEY"))
-                result["dns"]["dnssec_present"] = dnssec_present
-                progress.update(task, completed=100)
-
-            # Zone transfers if enabled
-            if not self.no_axfr:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    TimeElapsedColumn(),
-                    console=console,
-                    transient=True
-                ) as progress:
-                    task = progress.add_task(f"[{PRIMARY_BLUE}]Checking zone transfers[/{PRIMARY_BLUE}]")
-                    axfr_findings = []
-                    nameservers = result.get("dns", {}).get("records", {}).get("NS", []) or []
-                    
-                    for i, ns in enumerate(nameservers):
-                        progress.update(task, completed=(i/len(nameservers))*100)
-                        host = ns.split()[0].strip(".") if " " in ns else ns.strip(".")
-                        ok, out = self._try_axfr(host, domain)
-                        if ok:
-                            axfr_findings.append({"ns": host, "lines": out.splitlines()[:200]})
-                    
-                    result["dns"]["axfr"] = axfr_findings
-                    progress.update(task, completed=100)
-
-            # Enumerate subdomains
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True
-            ) as progress:
-                task = progress.add_task(f"[{PRIMARY_BLUE}]Enumerating subdomains[/{PRIMARY_BLUE}]")
-                subdomains = self._enum_crtsh(domain)
-                
-                if self.wordlist:
-                    progress.update(task, description=f"[{PRIMARY_BLUE}]Bruteforcing subdomains[/{PRIMARY_BLUE}]")
-                    subs = self._brute_subdomains(domain, self.wordlist, dns.resolver.Resolver())
-                    subdomains.extend(subs)
-                
-                result["subdomains"] = sorted(set(subdomains))
-                progress.update(task, completed=100)
-
-            # GeoIP lookup
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True
-            ) as progress:
-                task = progress.add_task(f"[{PRIMARY_BLUE}]Looking up GeoIP information[/{PRIMARY_BLUE}]")
-                
-                geo = {}
-                for i, ip in enumerate(ips):
-                    progress.update(task, completed=(i/len(ips))*100)
-                    g = self._geoip(ip)
-                    if g:
-                        geo[ip] = g
-                
-                result["geoip"] = geo
-                progress.update(task, completed=100)
-
-            # HTTP and TLS checks
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True
-            ) as progress:
-                task = progress.add_task(f"[{PRIMARY_BLUE}]Checking HTTP and TLS[/{PRIMARY_BLUE}]")
-                
-                try:
-                    cert = fetch_tls_cert(domain, 443, timeout=8)
-                    result["tls"] = extract_cert_summary(cert)
-                except Exception:
-                    result["tls"] = {}
-                
-                progress.update(task, description=f"[{PRIMARY_BLUE}]Fingerprinting HTTP servers[/{PRIMARY_BLUE}]")
-                http_fp = self._http_fingerprint(domain)
-                result["http"] = http_fp
-                
-                progress.update(task, completed=100)
 
         return result
 
@@ -504,9 +542,9 @@ class DomainScanner:
 
     def _enum_crtsh(self, domain: str) -> List[str]:
         try:
-            url = f"https://crt.sh/?q=%25.{domain}&output=json"
-            r = requests.get(url, timeout=self.timeout)
-            if r.status_code != 200:
+            url = f"https://crt.sh/?q=%25.{quote(domain)}&output=json"
+            r = rate_limited_get(url, crtsh_limiter, timeout=self.timeout)
+            if r is None or r.status_code != 200:
                 return []
             data = r.json()
             subs = []
@@ -544,8 +582,8 @@ class DomainScanner:
 
     def _geoip(self, ip: str) -> Optional[dict]:
         try:
-            r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=8)
-            if r.status_code == 200:
+            r = rate_limited_get(f"https://ipapi.co/{quote(ip)}/json/", geoip_limiter, timeout=8)
+            if r is not None and r.status_code == 200:
                 data = r.json()
                 return {
                     "ip": ip,
@@ -558,144 +596,6 @@ class DomainScanner:
                 }
         except Exception:
             return None
-        return None
-
-    def _scan_ports(self, ip: str, ports: List[int]) -> Dict[int, dict]:
-        findings = {}
-        
-        # Common service signatures
-        SERVICE_PROBES = {
-            21: b"220",  # FTP
-            22: b"SSH",  # SSH
-            25: b"SMTP",  # SMTP
-            80: b"GET / HTTP/1.0\r\n\r\n",  # HTTP
-            443: b"GET / HTTP/1.0\r\n\r\n",  # HTTPS
-            3306: b"\x0a",  # MySQL
-            5432: b"\x00\x00\x00\x08\x04\xd2\x16\x2f",  # PostgreSQL
-            6379: b"INFO\r\n",  # Redis
-            27017: b"\x41\x00\x00\x00",  # MongoDB
-        }
-        
-        # Common service names
-        SERVICE_NAMES = {
-            21: "FTP",
-            22: "SSH",
-            23: "Telnet",
-            25: "SMTP",
-            53: "DNS",
-            80: "HTTP",
-            110: "POP3",
-            143: "IMAP",
-            443: "HTTPS",
-            445: "SMB",
-            3306: "MySQL",
-            5432: "PostgreSQL",
-            6379: "Redis",
-            27017: "MongoDB",
-            8080: "HTTP-Proxy",
-            8443: "HTTPS-Alt",
-            3389: "RDP",
-            5900: "VNC",
-        }
-
-        for p in ports:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
-                
-                if s.connect_ex((ip, p)) == 0:
-                    service_info = {
-                        "status": "open",
-                        "service": SERVICE_NAMES.get(p, "unknown"),
-                        "banner": None,
-                        "version": None
-                    }
-                    
-                    # Try to get service banner
-                    try:
-                        if p in SERVICE_PROBES:
-                            s.send(SERVICE_PROBES[p])
-                        else:
-                            s.send(b"\\r\\n")
-                        
-                        banner = s.recv(1024)
-                        decoded_banner = banner.decode(errors='ignore').strip()
-                        
-                        service_info["banner"] = decoded_banner
-                        
-                        # Try to extract version information
-                        version_info = self._extract_version_info(p, decoded_banner)
-                        if version_info:
-                            service_info["version"] = version_info
-                            
-                        # Enhanced HTTP detection
-                        if p in [80, 443, 8080, 8443]:
-                            try:
-                                s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                s2.settimeout(3)
-                                s2.connect((ip, p))
-                                s2.send(b"HEAD / HTTP/1.1\\r\\nHost: " + ip.encode() + b"\\r\\n\\r\\n")
-                                http_resp = s2.recv(1024).decode(errors='ignore')
-                                server = self._extract_http_server(http_resp)
-                                if server:
-                                    service_info["server"] = server
-                                s2.close()
-                            except:
-                                pass
-                            
-                    except socket.timeout:
-                        pass
-                    except Exception as e:
-                        service_info["error"] = str(e)
-                    
-                    findings[p] = service_info
-                s.close()
-            except:
-                continue
-                
-        return findings
-        
-    def _extract_version_info(self, port: int, banner: str) -> Optional[str]:
-        # SSH Version
-        if port == 22 and "SSH" in banner:
-            ssh_version = banner.split("\\n")[0].strip()
-            return ssh_version
-            
-        # FTP Version
-        if port == 21 and "220" in banner:
-            ftp_version = banner.split("\\n")[0].strip()
-            return ftp_version
-            
-        # SMTP Version
-        if port == 25 and ("SMTP" in banner or "220" in banner):
-            smtp_version = banner.split("\\n")[0].strip()
-            return smtp_version
-            
-        # HTTP Server
-        if port in [80, 443, 8080, 8443]:
-            if "Server:" in banner:
-                return banner.split("Server:")[1].split("\\n")[0].strip()
-                
-        # MySQL Version
-        if port == 3306 and banner:
-            try:
-                return f"MySQL {banner.split(chr(0))[1].split('-')[1].split(chr(10))[0]}"
-            except:
-                pass
-                
-        # PostgreSQL Version
-        if port == 5432 and banner:
-            try:
-                return f"PostgreSQL {banner.split(chr(0))[1]}"
-            except:
-                pass
-                
-        return None
-        
-    def _extract_http_server(self, response: str) -> Optional[str]:
-        if "Server:" in response:
-            server_line = [line for line in response.split("\\n") if "Server:" in line][0]
-            return server_line.split("Server:")[1].strip()
         return None
 
     def _http_fingerprint(self, domain: str) -> dict:

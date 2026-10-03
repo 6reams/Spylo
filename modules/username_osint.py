@@ -1,16 +1,18 @@
 import asyncio
 import json
 import random
+import re
+import ssl
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import aiohttp
+import certifi
 from aiohttp import ClientResponse
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
 from rich.panel import Panel
-from rich.table import Table
-from rich.box import ROUNDED, SQUARE
+from rich.box import SQUARE
 
 # Modern minimal color scheme
 PRIMARY_BLUE = "#0066cc"  # Deeper blue for main elements
@@ -30,30 +32,51 @@ DEFAULT_HEADERS = [
 
 
 class UsernameScanner:
-    def __init__(self, timeout: int = 15, concurrency: int = 50, retries: int = 2, proxy: Optional[str] = None):
+    def __init__(
+        self,
+        timeout: int = 15,
+        concurrency: int = 50,
+        retries: int = 2,
+        proxy: Optional[str] = None,
+        verify_tls: bool = True,
+    ):
         self.timeout = timeout
         self.concurrency = concurrency
         self.retries = retries
         self.proxy = proxy
+        self.verify_tls = verify_tls
         with open(SITES_PATH, "r", encoding="utf-8") as f:
             self.sites: Dict[str, dict] = json.load(f)
+
+    def _ssl_option(self):
+        """Return the aiohttp `ssl` argument for this scanner.
+
+        Verification is on by default; `False` disables it entirely and is
+        only reachable through the explicit `verify_tls` opt-out.
+        """
+        if not self.verify_tls:
+            return False
+        return ssl.create_default_context(cafile=certifi.where())
 
     def scan(self, username: str) -> dict:
         try:
             # Show scan initialization
             console.print(f"[{PRIMARY_BLUE}]Starting scan for[/{PRIMARY_BLUE}] [{SECONDARY_BLUE}]{username}[/{SECONDARY_BLUE}]")
+            if not self.verify_tls:
+                console.print("[yellow]Warning: TLS certificate verification is disabled[/yellow]")
             console.print()
-            
+
             results = asyncio.run(self._scan_async(username))
             found_accounts = [r for r in results if r is not None and not r.get("error")]
             failed_sites = [r["site"] for r in results if r is not None and r.get("error")]
             
+            total = len(self.sites)
             summary = {
                 "username": username,
-                "total_checked": len(self.sites),
+                "total_checked": total,
                 "found": len(found_accounts),
                 "failed": len(failed_sites),
-                "success_rate": f"{(len(found_accounts) / len(self.sites)) * 100:.1f}%"
+                "success_rate": f"{(len(found_accounts) / total) * 100:.1f}%" if total else "0.0%"
             }
             
             if found_accounts:
@@ -85,7 +108,7 @@ class UsernameScanner:
     async def _scan_async(self, username: str) -> List[dict]:
         sem = asyncio.Semaphore(self.concurrency)
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        connector = aiohttp.TCPConnector(ssl=False)
+        connector = aiohttp.TCPConnector(ssl=self._ssl_option())
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             tasks = []
             for site, cfg in self.sites.items():
@@ -200,11 +223,10 @@ class UsernameScanner:
             return status == 200
         if error_type == "message":
             # if error message NOT present, assume account exists
-            return error_msg and (error_msg not in (text or ""))
+            return bool(error_msg) and error_msg not in (text or "")
         if error_type == "response_url":
             return str(resp.url) == str(resp.request_info.url)
         if error_type == "regex":
-            import re
             if not error_msg:
                 return status == 200
             return re.search(error_msg, text or "", re.I) is not None
