@@ -223,10 +223,6 @@
     "url": "https://imo.im/{account}",
     "errorType": "status_code"
   },
-  "Tagged": {
-    "url": "https://badoo.com/profile/{account}",
-    "errorType": "status_code"
-  },
   "Meetup": {
     "url": "https://www.meetup.com/members/{account}",
     "errorType": "status_code"
@@ -325,10 +321,6 @@
   },
   "ArtStation": {
     "url": "https://www.artstation.com/{account}",
-    "errorType": "status_code"
-  },
-  "Behance": {
-    "url": "https://www.behance.net/{account}",
     "errorType": "status_code"
   },
   "500px": {
