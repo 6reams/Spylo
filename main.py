@@ -34,7 +34,7 @@ console = Console()
 
 VERSION = "0.1.0"
 DOMAIN_SCAN_TYPES = ("all", "dns", "ports", "whois")
-EMAIL_SCAN_TYPES = ("all", "dns", "gravatar", "platforms", "breaches")
+EMAIL_SCAN_TYPES = ("all", "dns", "gravatar", "platforms", "breaches", "pivot")
 TARGET_TYPES = ("domain", "username", "email")
 
 SESSION_FILE = Path.home() / ".spylo" / "session.json"
@@ -660,6 +660,7 @@ class SPYLOShell(cmd.Cmd):
             "gravatar": "Looking up Gravatar profile",
             "platforms": "Probing platform registrations",
             "breaches": "Checking breach databases",
+            "pivot": "Pivoting to username and domain scanners",
         }[scan_type]
         try:
             with self.console.status(
@@ -673,6 +674,8 @@ class SPYLOShell(cmd.Cmd):
                     return {"email": target, "platforms": scanner.scan_platforms(target)}
                 if scan_type == "breaches":
                     return {"email": target, "breaches": scanner.scan_breaches(target)}
+                if scan_type == "pivot":
+                    return scanner.scan_pivot(target)
                 return scanner.scan(target)
         except KeyboardInterrupt:
             self.console.print("\n[yellow]Scan interrupted[/yellow]")
